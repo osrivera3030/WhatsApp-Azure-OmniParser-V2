@@ -1,0 +1,28 @@
+# --- ETL / datos ---
+pandas>=2.0
+openpyxl>=3.1
+
+# --- Automatización de WhatsApp Web (Selenium) ---
+selenium>=4.15
+webdriver-manager>=4.0
+
+# --- Persistencia en Azure ---
+azure-data-tables>=12.4
+
+# --- IA local: imágenes (OCR) ---
+pillow>=10.0
+pytesseract>=0.3.10
+# Requiere además el binario de Tesseract instalado en el sistema:
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   Debian/Ubuntu: sudo apt-get install tesseract-ocr tesseract-ocr-spa
+
+# --- IA local: audio (transcripción) ---
+openai-whisper>=20231117
+# Requiere ffmpeg instalado y disponible en el PATH:
+#   Windows: https://ffmpeg.org/download.html
+#   Debian/Ubuntu: sudo apt-get install ffmpeg
+
+# --- IA local: texto (sentimiento / categorización) ---
+transformers>=4.36
+torch>=2.1
+sentencepiece>=0.1.99

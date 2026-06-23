@@ -1,0 +1,126 @@
+=========================================================
+ SETUP COMPLETO DE OMNIPARSER V2 PARA SOLO_NUBE
+ =========================================================
+
+REQUISITOS PREVIOS
+------------------
+- Python 3.10-3.12
+- Git instalado
+- ffmpeg en PATH (para Whisper)
+- Tesseract OCR instalado en C:\Program Files\Tesseract-OCR\
+- Edge WebDriver compatible con tu versión de Edge
+
+
+PASO 1 — Clonar OmniParser
+---------------------------
+Ejecutar desde C:\Users\Oscar\Desktop\Nueva_prueba\
+
+    git clone https://github.com/microsoft/OmniParser OmniParser
+
+Resultado esperado: carpeta OmniParser\ con util\utils.py dentro.
+
+
+PASO 2 — Descargar pesos del modelo
+-------------------------------------
+OmniParser usa dos modelos: detección de íconos (YOLO) y descripción
+de íconos (Florence-2 fine-tuned). Se descargan con la CLI de HuggingFace.
+
+IMPORTANTE: usar "hf download" NO "huggingface-cli download"
+(huggingface-cli está obsoleto y ya no funciona).
+
+    cd C:\Users\Oscar\Desktop\Nueva_prueba\OmniParser
+
+    hf download microsoft/OmniParser-v2.0 icon_detect/model.pt          --local-dir weights
+    hf download microsoft/OmniParser-v2.0 icon_detect/model.yaml        --local-dir weights
+    hf download microsoft/OmniParser-v2.0 icon_detect/train_args.yaml   --local-dir weights
+    hf download microsoft/OmniParser-v2.0 icon_caption/config.json      --local-dir weights
+    hf download microsoft/OmniParser-v2.0 icon_caption/generation_config.json --local-dir weights
+    hf download microsoft/OmniParser-v2.0 icon_caption/model.safetensors --local-dir weights
+
+Renombrar la carpeta de pesos del caption model:
+    cd weights
+    ren icon_caption icon_caption_florence
+
+    (IMPORTANTE: el nuevo nombre NO lleva "weights\" delante,
+     solo el nombre nuevo: icon_caption_florence)
+
+Estructura final esperada:
+    OmniParser\
+    └── weights\
+        ├── icon_detect\
+        │   ├── model.pt
+        │   ├── model.yaml
+        │   └── train_args.yaml
+        └── icon_caption_florence\
+            ├── config.json
+            ├── generation_config.json
+            └── model.safetensors
+
+
+PASO 3 — Activar el entorno virtual
+--------------------------------------
+    cd C:\Users\Oscar\Desktop\Nueva_prueba
+    .\venv\Scripts\Activate.ps1
+
+Si da error de ejecución de scripts:
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+
+
+PASO 4 — Instalar dependencias de OmniParser
+----------------------------------------------
+    cd C:\Users\Oscar\Desktop\Nueva_prueba\solo_nube
+    pip install -r requirements-omniparser.txt
+
+Versiones críticas (ya fijadas en el archivo):
+  - transformers>=4.36,<4.44   (>=4.44 rompe Florence-2: AttributeError forced_bos_token_id)
+  - paddleocr>=2.7,<3.0        (3.x eliminó parámetros que OmniParser usa: show_log, use_gpu...)
+  - paddlepaddle>=2.5,<3.0
+  - openai>=1.3                (util/utils.py importa AzureOpenAI a nivel de módulo)
+  - matplotlib>=3.7            (mismo motivo)
+
+
+PASO 5 — Verificar que los modelos cargan
+-------------------------------------------
+    cd C:\Users\Oscar\Desktop\Nueva_prueba\solo_nube
+    python -c "from ia_local.omniparser_detector import _cargar_modelos; _cargar_modelos(); print('OK')"
+
+Salida esperada (puede tardar 1-2 min la primera vez):
+    INFO: Cargando modelo de detección de íconos (YOLO)...
+    INFO: Cargando modelo de descripción de íconos (Florence-2)...
+    OK
+
+Errores conocidos y sus fixes ya aplicados en el código:
+  - "flash_attn not found": resuelto con stubs en sys.modules + attn_implementation=eager
+  - "flash_attn.__spec__ is None": resuelto con ModuleSpec en cada stub
+  - "ModuleNotFoundError: ia_local": ejecutar siempre desde solo_nube\, no desde Nueva_prueba\
+
+
+PASO 6 — Correr el pipeline
+-----------------------------
+    cd C:\Users\Oscar\Desktop\Nueva_prueba\solo_nube
+    python "4-Guarda_mjs_recep/procesar_respuestas.py"
+
+Escanear QR en Edge cuando aparezca la ventana, luego presionar ENTER.
+
+Qué hace con los audios:
+  1. Busca botones "Reproducir mensaje de voz" en el DOM (aria-label).
+  2. Si los encuentra: clica por coordenadas (document.elementFromPoint).
+  3. Si no los encuentra: lanza OmniParser V2 con captura al 50% (más rápido).
+  4. El hook de decodeAudioData captura el audio cuando WhatsApp lo decodifica.
+  5. El archivo se guarda en media_whatsapp\<telefono>\ como .ogg (u otro formato).
+  6. Whisper transcribe el audio a texto y lo sube a Azure junto con el resto.
+
+Archivos guardados:
+  - Imágenes: media_whatsapp\<telefono>\<timestamp>_<indice>.jpg
+  - Audios:   media_whatsapp\<telefono>\<timestamp>_audio_<indice>.ogg
+  - Videos:   media_whatsapp\<telefono>\<timestamp>_<indice>.mp4
+
+
+NOTA SOBRE VELOCIDAD
+---------------------
+OmniParser (Florence-2) corre en CPU si no hay GPU NVIDIA con CUDA.
+En CPU tarda ~3-10 segundos por captura de pantalla.
+El código detecta CUDA automáticamente (config.py: _detectar_device()).
+Si tu PC tiene GPU NVIDIA, instalar torch con CUDA acelera esto enormemente:
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+=========================================================

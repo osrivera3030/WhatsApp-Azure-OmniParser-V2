@@ -1,0 +1,42 @@
+# Entorno virtual
+venv/
+.venv/
+env/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Medios descargados de WhatsApp (pueden ser archivos grandes y privados)
+media_whatsapp/
+
+# Perfil de sesión de Edge/Chrome (contiene cookies y sesión de WhatsApp)
+perfil_whatsapp/
+Edge_Profile/
+
+# Modelos descargados por Whisper (pesados, se descargan automáticamente)
+models/
+
+# Datos locales del pipeline
+Data/
+
+# Backups
+*.bak
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+desktop.ini
+
+weights/
