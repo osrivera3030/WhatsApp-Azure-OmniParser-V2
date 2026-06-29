@@ -75,6 +75,11 @@ AZURE_CONNECTION_STRING: str = (
     "EndpointSuffix=core.windows.net"
 )
 
+# Azure Blob Storage — contenedor donde se guardan imágenes y audios de WhatsApp.
+# Usa la misma cuenta (AZURE_CONNECTION_STRING). El contenedor debe existir
+# previamente en el portal de Azure (o se crea automáticamente con exist_ok).
+AZURE_BLOB_CONTAINER: str = "media-whatsapp"
+
 # Nombres de tabla agrupados en un diccionario para evitar duplicar strings
 # sueltos en cada script (una sola fuente de verdad por tabla).
 TABLAS: dict[str, str] = {
@@ -116,6 +121,20 @@ OCR_IDIOMAS: str = "spa+eng"
 # Déjalo en None si Tesseract ya funciona desde cualquier terminal (es decir,
 # si el comando `tesseract --version` te responde sin error).
 TESSERACT_CMD: str | None = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ── Azure Cognitive Services Speech-to-Text ───────────────────────────────
+# Método PRINCIPAL de transcripción (más rápido que Whisper, corre en cloud).
+# Adaptado del ejemplo de Juan Fernando Ramírez / SCITIS GROUP.
+# Flujo: POST issueToken → POST audio/ogg → JSON { DisplayText }
+#
+# AZURE_SPEECH_KEY:      clave del servicio (Ocp-Apim-Subscription-Key).
+# AZURE_SPEECH_REGION:   región del recurso en Azure (ej. "eastus").
+# AZURE_SPEECH_LANGUAGE: idioma BCP-47 (es-HN Honduras, es-CO Colombia...).
+#
+# Si AZURE_SPEECH_KEY está vacío, audio_transcriber.py usa Whisper local.
+AZURE_SPEECH_KEY: str      = "e6232e11c3f04bc292f59cb28949f2ad"
+AZURE_SPEECH_REGION: str   = "eastus"
+AZURE_SPEECH_LANGUAGE: str = "es-HN"
 
 # Tamaño de modelo de Whisper a usar para transcripción de audio offline.
 # Opciones típicas: "tiny", "base", "small", "medium", "large".

@@ -8,6 +8,7 @@ webdriver-manager>=4.0
 
 # --- Persistencia en Azure ---
 azure-data-tables>=12.4
+azure-storage-blob>=12.19
 
 # --- IA local: imágenes (OCR) ---
 pillow>=10.0
