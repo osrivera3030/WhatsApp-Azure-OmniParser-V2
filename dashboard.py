@@ -1,552 +1,503 @@
-"""
-dashboard.py - Panel de control unificado solo_nube.
-"""
 from __future__ import annotations
-import logging, os, queue, subprocess, sys, threading, time
+import os, queue, subprocess, sys, threading, time, traceback, pathlib
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
-from azure.data.tables import TableClient, UpdateMode
+
+_LOG = pathlib.Path(__file__).resolve().parent / "dashboard_error.log"
+def _ck(msg):
+    with _LOG.open("a", encoding="utf-8") as fh:
+        fh.write("[{}] {}\n".format(datetime.now().strftime("%H:%M:%S"), msg))
+_LOG.write_text("", encoding="utf-8")
+_ck("imports OK")
 
 sys.path.append(str(Path(__file__).resolve().parent))
 from config import AZURE_CONNECTION_STRING, TABLAS, get_logger
+_ck("config OK")
 
-logger = get_logger(__name__)
+logger   = get_logger(__name__)
 ROOT_DIR = Path(__file__).resolve().parent
 
-# Columnas: (key, encabezado, ancho, editable)
 COLUMNAS = [
-    ("ClienteID",          "ID Cliente",      100, False),
-    ("phone",              "Telefono",        120, False),
-    ("name",               "Nombre",          160, True),
-    ("Respuesta_Recibida", "Respuesta",        90, True),
-    ("Texto_Respuesta",    "Texto respuesta", 260, True),
-    ("fecha_envio_msg",    "Fecha envio msg", 130, False),
-    ("Fecha_Verificacion", "Fecha procesado", 150, False),
-    ("mensaje_enviado",    "Mensaje enviado", 200, True),
+    ("ClienteID",          "ID",       75,  False),
+    ("phone",              "Telefono", 115, False),
+    ("name",               "Nombre",   155, False),
+    ("Respuesta_Recibida", "Rta",       55, False),
+    ("Texto_Respuesta",    "Respuesta",270, False),
+    ("fecha_envio_msg",    "Enviado",  105, False),
+    ("Fecha_Verificacion", "Procesado",125, False),
+    ("mensaje_enviado",    "Mensaje",  190, False),
 ]
-EDITABLE_COLS = {c[0] for c in COLUMNAS if c[3]}
 COL_KEYS = [c[0] for c in COLUMNAS]
 
-# Pasos: (label, script, necesita_wtp, intervalo_min_default)
 PASOS = [
-    ("1 Limpieza datos",      "1-Data_cleaning/Data_cleaning.py",             False, 1440),
-    ("2 Validar WhatsApp",    "2-Validation_wtp/validacion_st.py",            True,  1440),
-    ("3 Enviar mensajes",     "3-Envio_mjs/envio_stg.py",                     True,   120),
-    ("4 Capturar respuestas", "4-Guarda_mjs_recep/procesar_respuestas_v2.py", True,    60),
-    ("5 Enviar respuesta",    "5-envio_mjs_repuesta/res_final.py",            True,   120),
-    ("6 Archivar/resetear",   "6-Data_storege/respuesta_final.py",            False, 21600),
+    ("1  Limpieza datos",        "1-Data_cleaning/Data_cleaning.py",             86400, False),
+    ("2  Validar WhatsApp",      "2-Validation_wtp/validacion_st.py",            86400, True),
+    ("3  Enviar mensajes",       "3-Envio_mjs/envio_stg.py",                      7200, True),
+    ("4  Capturar respuestas",   "4-Guarda_mjs_recep/procesar_respuestas_v2.py",  3600, True),
+    ("5  Enviar agradecimiento", "5-envio_mjs_repuesta/res_final.py",             7200, True),
+    ("6  Archivar / resetear",   "6-Data_storege/respuesta_final.py",          777600, False),
 ]
 
-BG_MAIN  = "#1e1e2e"
-BG_LEFT  = "#181825"
-BG_CARD  = "#242436"
-BG_CELL  = "#313244"
-FG_MAIN  = "#cdd6f4"
-FG_ACC   = "#cba6f7"
-FG_GRN   = "#a6e3a1"
-FG_RED   = "#f38ba8"
-FG_YEL   = "#f9e2af"
-FG_DIM   = "#6c7086"
-
-
-class QueueLogHandler(logging.Handler):
-    def __init__(self, q):
-        super().__init__()
-        self.q = q
-        self.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%H:%M:%S"))
-    def emit(self, record):
-        self.q.put(self.format(record))
+C = dict(
+    bg="#1e1e2e", panel="#181825", card="#242436", cell="#313244",
+    fg="#cdd6f4", acc="#cba6f7",  grn="#a6e3a1",  red="#f38ba8",
+    yel="#f9e2af", dim="#6c7086", blue="#89b4fa", teal="#94e2d5",
+)
 
 
 class AzureManager:
     def __init__(self):
-        self.client = TableClient.from_connection_string(AZURE_CONNECTION_STRING, TABLAS["directorio"])
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from azure.data.tables import TableClient
+            self._client = TableClient.from_connection_string(
+                AZURE_CONNECTION_STRING, TABLAS["directorio"])
+        return self._client
+
     def cargar(self):
-        ents = list(self.client.list_entities())
+        ents = list(self._get_client().list_entities())
         for i, e in enumerate(ents, 1):
             if not e.get("ClienteID"):
                 e["ClienteID"] = "CLI-{:04d}".format(i)
         return ents
-    def guardar(self, entity):
-        self.client.update_entity(mode=UpdateMode.MERGE, entity=entity)
-
-
-class CellEditor:
-    def __init__(self, tree, on_commit):
-        self.tree = tree; self.on_commit = on_commit
-        self._entry = self._item = self._col = None
-    def abrir(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell": return
-        col_id = self.tree.identify_column(event.x)
-        item   = self.tree.identify_row(event.y)
-        if not item: return
-        idx = int(col_id.replace("#","")) - 1
-        if COLUMNAS[idx][0] not in EDITABLE_COLS: return
-        bbox = self.tree.bbox(item, col_id)
-        if not bbox: return
-        x, y, w, h = bbox
-        self.cerrar()
-        self._item = item; self._col = col_id
-        self._entry = tk.Entry(self.tree, font=("Segoe UI", 9), bg="#45475a", fg=FG_MAIN, relief="flat")
-        self._entry.insert(0, self.tree.set(item, col_id))
-        self._entry.select_range(0, tk.END)
-        self._entry.place(x=x, y=y, width=w, height=h)
-        self._entry.focus_set()
-        self._entry.bind("<Return>",   self._ok)
-        self._entry.bind("<Escape>",   lambda e: self.cerrar())
-        self._entry.bind("<FocusOut>", self._ok)
-    def _ok(self, _=None):
-        if not self._entry: return
-        val = self._entry.get()
-        idx = int(self._col.replace("#","")) - 1
-        self.tree.set(self._item, self._col, val)
-        self.on_commit(self._item, COLUMNAS[idx][0], val)
-        self.cerrar()
-    def cerrar(self):
-        if self._entry: self._entry.destroy(); self._entry = None
 
 
 class Scheduler:
     def __init__(self, on_run, on_log):
-        self.on_run = on_run; self.on_log = on_log
-        self._run = False; self._t = None
-        # interval ahora en segundos
-        self.states = {i: {"active": False, "interval": PASOS[i][3]*60, "last": None} for i in range(len(PASOS))}
-    def start(self):
-        if self._run: return
-        self._run = True
-        self._t = threading.Thread(target=self._loop, daemon=True); self._t.start()
+        self.on_run  = on_run
+        self.on_log  = on_log
+        self._activo = False
+        self.estados = {
+            i: {"activo": False, "intervalo": PASOS[i][2], "ultimo": None}
+            for i in range(len(PASOS))
+        }
+
+    def iniciar(self):
+        self._activo = True
+        threading.Thread(target=self._loop, daemon=True).start()
         self.on_log("Automatizacion iniciada")
-    def stop(self):
-        self._run = False; self.on_log("Automatizacion detenida")
-    def mark_done(self, idx):
-        self.states[idx]["last"] = datetime.now()
-    def next_str(self, idx):
-        s = self.states[idx]
-        if not s["active"]: return "--"
-        if s["last"] is None: return "ahora"
-        diff = s["last"] + timedelta(seconds=s["interval"]) - datetime.now()
-        sec = int(diff.total_seconds())
+
+    def detener(self):
+        self._activo = False
+        self.on_log("Automatizacion detenida")
+
+    def marcar(self, idx):
+        self.estados[idx]["ultimo"] = datetime.now()
+
+    def proximo(self, idx):
+        e = self.estados[idx]
+        if not e["activo"]:     return "--"
+        if e["ultimo"] is None: return "ahora"
+        delta = e["ultimo"] + timedelta(seconds=e["intervalo"]) - datetime.now()
+        sec = int(delta.total_seconds())
         if sec <= 0: return "ahora"
-        d, r = divmod(sec, 86400); h, r2 = divmod(r, 3600); m, s2 = divmod(r2, 60)
+        d, r = divmod(sec, 86400); h, r2 = divmod(r, 3600); m, s = divmod(r2, 60)
         if d: return "{}d {}h".format(d, h)
         if h: return "{}h {}m".format(h, m)
-        if m: return "{}m {}s".format(m, s2)
-        return "{}s".format(s2)
+        if m: return "{}m {}s".format(m, s)
+        return "{}s".format(s)
+
     def _loop(self):
-        while self._run:
+        while self._activo:
             now = datetime.now()
             for i in range(len(PASOS)):
-                s = self.states[i]
-                if not s["active"]: continue
-                if s["last"] is None or (now - s["last"]).total_seconds() >= s["interval"]:
+                e = self.estados[i]
+                if not e["activo"]: continue
+                ult = e["ultimo"]
+                if ult is None or (now - ult).total_seconds() >= e["intervalo"]:
                     self.on_log("Auto: {}".format(PASOS[i][0]))
-                    self.mark_done(i)
-                    self.on_run(PASOS[i][1], PASOS[i][2])
+                    self.marcar(i)
+                    self.on_run(i)
                     time.sleep(5)
-            time.sleep(30)
+            time.sleep(20)
 
 
 class Dashboard:
     def __init__(self, root):
-        self.root = root
-        self.lq = queue.Queue()
-        self.az = AzureManager()
-        self.ents = {}
+        _ck("Dashboard init")
+        self.root  = root
+        self.lq    = queue.Queue()
+        self.az    = AzureManager()
+        self.ents  = {}
         self._busy = False
-        self._wtp  = False
-        self.driver = None
-        self.sched = Scheduler(self._run_paso, self._log)
-        self._setup_win()
-        self._build_ui()
-        self._attach_log()
-        self._load_table()
-        self._poll_logs()
+        self.sched = Scheduler(self._lanzar_por_idx, self._log)
+        self._spins_d = []; self._spins_h = []
+        self._spins_m = []; self._spins_s = []
+        self._chks      = []
+        self._lbls_prox = []
+        self._btns_paso = []
+        _ck("_config_ventana")
+        self._config_ventana()
+        _ck("_build")
+        self._build()
+        _ck("_cargar_tabla")
+        self._cargar_tabla()
+        _ck("polls")
+        self._poll_log()
         self._poll_sched()
+        _ck("init completo")
 
-    def _setup_win(self):
-        self.root.title("Panel de Control - solo_nube")
-        self.root.geometry("1380x820")
-        self.root.minsize(1000, 640)
-        self.root.configure(bg=BG_MAIN)
+    def _config_ventana(self):
+        self.root.title("solo_nube")
+        self.root.geometry("1440x840")
+        self.root.configure(bg=C["bg"])
         s = ttk.Style(); s.theme_use("clam")
-        s.configure("Treeview", background="#2a2a3e", foreground=FG_MAIN,
-                    fieldbackground="#2a2a3e", rowheight=26, font=("Segoe UI", 9))
-        s.configure("Treeview.Heading", background=BG_CELL, foreground=FG_ACC,
+        s.configure("Treeview", background="#2a2a3e", foreground=C["fg"],
+                    fieldbackground="#2a2a3e", rowheight=24, font=("Segoe UI", 9))
+        s.configure("Treeview.Heading", background=C["cell"], foreground=C["acc"],
                     font=("Segoe UI", 9, "bold"))
-        s.map("Treeview", background=[("selected","#45475a")])
+        s.map("Treeview", background=[("selected", "#45475a")])
 
-    def _build_ui(self):
-        m = tk.Frame(self.root, bg=BG_MAIN); m.pack(fill="both", expand=True, padx=10, pady=10)
-        left = tk.Frame(m, bg=BG_LEFT, width=270); left.pack(side="left", fill="y", padx=(0,8)); left.pack_propagate(False)
-        right = tk.Frame(m, bg=BG_MAIN); right.pack(side="left", fill="both", expand=True)
-        self._left_panel(left)
-        self._right_panel(right)
+    def _build(self):
+        m = tk.Frame(self.root, bg=C["bg"])
+        m.pack(fill="both", expand=True, padx=10, pady=10)
+        side = tk.Frame(m, bg=C["panel"], width=260)
+        side.pack(side="left", fill="y", padx=(0, 8))
+        side.pack_propagate(False)
+        self._sidebar(side)
+        right = tk.Frame(m, bg=C["bg"])
+        right.pack(side="left", fill="both", expand=True)
+        self._panel_der(right)
 
-    # ─── PANEL IZQUIERDO ───────────────────────────────────────────────────
-    def _left_panel(self, p):
-        cv = tk.Canvas(p, bg=BG_LEFT, highlightthickness=0)
-        sb = ttk.Scrollbar(p, orient="vertical", command=cv.yview)
-        cv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y"); cv.pack(side="left", fill="both", expand=True)
-        f = tk.Frame(cv, bg=BG_LEFT); win = cv.create_window((0,0), window=f, anchor="nw")
-        f.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfig(win, width=e.width))
+    def _sidebar(self, p):
+        _ck("sidebar")
+        cv = tk.Canvas(p, bg=C["panel"], highlightthickness=0)
+        vsb = ttk.Scrollbar(p, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        f = tk.Frame(cv, bg=C["panel"])
+        wid = cv.create_window((0, 0), window=f, anchor="nw")
+        f.bind("<Configure>",  lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfig(wid, width=e.width))
 
-        def lbl(txt, fg=FG_MAIN, font=("Segoe UI", 8), **kw):
-            return tk.Label(f, text=txt, bg=BG_LEFT, fg=fg, font=font, **kw)
+        def L(txt, fg=None, fnt=("Segoe UI", 8)):
+            return tk.Label(f, text=txt, bg=C["panel"], fg=fg or C["fg"], font=fnt)
 
-        # ── Titulo ──
-        lbl("solo_nube", fg=FG_ACC, font=("Segoe UI", 12, "bold")).pack(pady=(14,1), padx=10, anchor="w")
-        lbl("Panel de control de pipeline", fg=FG_DIM).pack(padx=10, anchor="w", pady=(0,8))
+        L("solo_nube", fg=C["acc"], fnt=("Segoe UI", 13, "bold")).pack(padx=12, pady=(14,1), anchor="w")
+        L("Panel de control", fg=C["dim"]).pack(padx=12, anchor="w")
+        ttk.Separator(f).pack(fill="x", padx=12, pady=8)
 
-        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=10, pady=4)
+        L("CONFIGURACION", fg=C["acc"], fnt=("Segoe UI", 8, "bold")).pack(padx=12, anchor="w", pady=(0,4))
+        cfg = tk.Frame(f, bg=C["card"], padx=8, pady=6)
+        cfg.pack(fill="x", padx=8, pady=(0,4))
 
-        # ── WhatsApp ──
-        lbl("SESION WHATSAPP", fg=FG_ACC, font=("Segoe UI", 8, "bold")).pack(padx=10, anchor="w", pady=(6,2))
-        lbl("Se abre una sola vez y permanece activa", fg=FG_DIM, font=("Segoe UI", 7)).pack(padx=10, anchor="w", pady=(0,4))
-        self.btn_wtp = tk.Button(f, text="Abrir WhatsApp Web", bg=FG_GRN, fg="#1e1e2e",
-                                  font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", pady=6,
-                                  command=self._open_wtp)
-        self.btn_wtp.pack(fill="x", padx=10, pady=(0,4))
-        self.lbl_wtp = lbl("Estado: no iniciado", fg=FG_RED)
-        self.lbl_wtp.pack(padx=10, anchor="w", pady=(0,6))
+        r1 = tk.Frame(cfg, bg=C["card"]); r1.pack(fill="x", pady=2)
+        tk.Label(r1, text="Codigo de pais", bg=C["card"], fg=C["fg"], font=("Segoe UI", 8)).pack(side="left")
+        self.var_pais = tk.StringVar(value="504")
+        tk.Entry(r1, textvariable=self.var_pais, width=6,
+                 bg=C["cell"], fg=C["teal"], insertbackground=C["teal"],
+                 relief="flat", font=("Segoe UI", 9, "bold")).pack(side="right")
 
-        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=10, pady=4)
+        r2 = tk.Frame(cfg, bg=C["card"]); r2.pack(fill="x", pady=2)
+        tk.Label(r2, text="Mensajes a enviar (paso 3)", bg=C["card"], fg=C["fg"],
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.sp_cantidad = tk.Spinbox(r2, from_=1, to=9999, width=5,
+                                      bg=C["cell"], fg=C["teal"],
+                                      buttonbackground="#45475a",
+                                      font=("Segoe UI", 9, "bold"))
+        self.sp_cantidad.delete(0, "end"); self.sp_cantidad.insert(0, "20")
+        self.sp_cantidad.pack(side="right")
 
-        # ── Config envio ──
-        lbl("CONFIGURACION DE ENVIO", fg=FG_ACC, font=("Segoe UI", 8, "bold")).pack(padx=10, anchor="w", pady=(6,4))
+        ttk.Separator(f).pack(fill="x", padx=12, pady=8)
+        L("EJECUTAR AHORA", fg=C["acc"], fnt=("Segoe UI", 8, "bold")).pack(padx=12, anchor="w", pady=(0,4))
 
-        row1 = tk.Frame(f, bg=BG_LEFT); row1.pack(fill="x", padx=10, pady=2)
-        tk.Label(row1, text="Max mensajes:", bg=BG_LEFT, fg=FG_MAIN, font=("Segoe UI", 8)).pack(side="left")
-        self.spin_cant = tk.Spinbox(row1, from_=1, to=500, width=5, bg=BG_CELL, fg=FG_MAIN,
-                                     buttonbackground="#45475a", font=("Segoe UI", 8))
-        self.spin_cant.delete(0,"end"); self.spin_cant.insert(0,"10")
-        self.spin_cant.pack(side="left", padx=(4,0))
+        for i, (label, script, seg_def, wtp) in enumerate(PASOS):
+            _ck("paso {}".format(i))
+            card = tk.Frame(f, bg=C["card"], padx=6, pady=5)
+            card.pack(fill="x", padx=8, pady=3)
 
-        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=10, pady=8)
+            rt = tk.Frame(card, bg=C["card"]); rt.pack(fill="x")
+            tk.Label(rt, text="WTP" if wtp else "LOC",
+                     bg=C["teal"] if wtp else C["dim"], fg="#1e1e2e",
+                     font=("Segoe UI", 6, "bold"), padx=3, pady=1).pack(side="left", padx=(0,4))
+            btn = tk.Button(rt, text="{}".format(label),
+                            bg=C["cell"], fg=C["fg"], font=("Segoe UI", 8),
+                            relief="flat", cursor="hand2", anchor="w", padx=4, pady=3,
+                            command=lambda idx=i: self._lanzar_por_idx(idx))
+            btn.pack(side="left", fill="x", expand=True)
+            self._btns_paso.append(btn)
 
-        # ── Pasos ──
-        lbl("PASOS DEL PIPELINE", fg=FG_ACC, font=("Segoe UI", 8, "bold")).pack(padx=10, anchor="w", pady=(0,2))
-        lbl("Ejecuta manualmente o activa Auto con intervalo", fg=FG_DIM, font=("Segoe UI", 7)).pack(padx=10, anchor="w", pady=(0,6))
+            rA = tk.Frame(card, bg=C["card"]); rA.pack(fill="x", pady=(4,0))
+            var = tk.BooleanVar(value=False); self._chks.append(var)
+            tk.Checkbutton(rA, text="Auto cada", variable=var,
+                           bg=C["card"], fg=C["grn"], selectcolor=C["cell"],
+                           activebackground=C["card"], font=("Segoe UI", 7),
+                           command=lambda idx=i, v=var: self._toggle_auto(idx, v)
+                           ).pack(side="left")
+            lp = tk.Label(rA, text="prox: --", bg=C["card"], fg=C["dim"], font=("Segoe UI", 7))
+            lp.pack(side="right"); self._lbls_prox.append(lp)
 
-        self.btns = []; self.chks = []; self.spins = []; self.lbls_next = []
+            d_d, r0 = divmod(seg_def, 86400)
+            d_h, r1 = divmod(r0, 3600)
+            d_m, d_s = divmod(r1, 60)
+            rT = tk.Frame(card, bg=C["card"]); rT.pack(fill="x")
 
-        for i in range(len(PASOS)):
-            label, script, wtp, interval_min = PASOS[i]
-            card = tk.Frame(f, bg=BG_CARD, padx=6, pady=5); card.pack(fill="x", padx=8, pady=3)
-
-            # Cabecera
-            head = tk.Frame(card, bg=BG_CARD); head.pack(fill="x")
-            badge = "[WTP]" if wtp else "[LOC]"
-            bcol  = "#89b4fa" if wtp else "#a6e3a1"
-            tk.Label(head, text=badge, bg=BG_CARD, fg=bcol, font=("Segoe UI", 7, "bold")).pack(side="left")
-            tk.Label(head, text=" "+label, bg=BG_CARD, fg=FG_MAIN, font=("Segoe UI", 8, "bold")).pack(side="left")
-
-            # Boton ejecutar
-            btn = tk.Button(card, text="▶ Ejecutar ahora", bg=BG_CELL, fg=FG_MAIN,
-                            font=("Segoe UI", 8), relief="flat", cursor="hand2", pady=3,
-                            command=lambda s=script, w=wtp: self._run_paso(s, w))
-            btn.pack(fill="x", pady=(4,2))
-            self.btns.append(btn)
-
-            # Fila auto: checkbox + d/h/m/s
-            # Convertir intervalo default (minutos) a d/h/m/s
-            total_s  = interval_min * 60
-            d_def    = total_s // 86400
-            h_def    = (total_s % 86400) // 3600
-            m_def    = (total_s % 3600) // 60
-            s_def    = total_s % 60
-
-            var = tk.BooleanVar(value=False); self.chks.append(var)
-            row0 = tk.Frame(card, bg=BG_CARD); row0.pack(fill="x", pady=(2,0))
-            tk.Checkbutton(row0, text="Auto cada:", variable=var, bg=BG_CARD, fg=FG_GRN,
-                           selectcolor=BG_CELL, activebackground=BG_CARD, font=("Segoe UI", 7),
-                           command=lambda idx=i, v=var: self._toggle(idx, v)).pack(side="left")
-            ln = tk.Label(row0, text="prox: --", bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 7))
-            ln.pack(side="right"); self.lbls_next.append(ln)
-
-            # Fila d/h/m/s
-            row1 = tk.Frame(card, bg=BG_CARD); row1.pack(fill="x")
-            def _mk_sp(parent, maxv, defv, idx=i):
-                sp = tk.Spinbox(parent, from_=0, to=maxv, width=3, bg=BG_CELL, fg=FG_MAIN,
+            def mk_sp(parent, maxv, defv, _i=i):
+                sp = tk.Spinbox(parent, from_=0, to=maxv, width=3,
+                                bg=C["cell"], fg=C["fg"],
                                 buttonbackground="#45475a", font=("Segoe UI", 7),
-                                command=lambda ii=idx: self._upd_interval(ii))
-                sp.delete(0,"end"); sp.insert(0, str(defv))
-                sp.bind("<FocusOut>", lambda e, ii=idx: self._upd_interval(ii))
+                                command=lambda ii=_i: self._upd_intervalo(ii))
+                sp.delete(0, "end"); sp.insert(0, str(defv))
+                sp.bind("<FocusOut>", lambda e, ii=_i: self._upd_intervalo(ii))
                 return sp
 
-            sp_d = _mk_sp(row1, 365, d_def)
-            sp_d.pack(side="left")
-            tk.Label(row1, text="d", bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 7)).pack(side="left", padx=(1,4))
-            sp_h = _mk_sp(row1, 23, h_def)
-            sp_h.pack(side="left")
-            tk.Label(row1, text="h", bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 7)).pack(side="left", padx=(1,4))
-            sp_m = _mk_sp(row1, 59, m_def)
-            sp_m.pack(side="left")
-            tk.Label(row1, text="m", bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 7)).pack(side="left", padx=(1,4))
-            sp_s = _mk_sp(row1, 59, s_def)
-            sp_s.pack(side="left")
-            tk.Label(row1, text="s", bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 7)).pack(side="left", padx=(1,0))
-            self.spins.append((sp_d, sp_h, sp_m, sp_s))
+            def mk_l(parent, txt):
+                return tk.Label(parent, text=txt, bg=C["card"], fg=C["dim"], font=("Segoe UI", 7))
 
-        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=10, pady=8)
+            sd = mk_sp(rT, 365, d_d); sd.pack(side="left"); mk_l(rT,"d").pack(side="left",padx=(1,4))
+            sh = mk_sp(rT, 23,  d_h); sh.pack(side="left"); mk_l(rT,"h").pack(side="left",padx=(1,4))
+            sm = mk_sp(rT, 59,  d_m); sm.pack(side="left"); mk_l(rT,"m").pack(side="left",padx=(1,4))
+            ss = mk_sp(rT, 59,  d_s); ss.pack(side="left"); mk_l(rT,"s").pack(side="left",padx=(1,0))
+            self._spins_d.append(sd); self._spins_h.append(sh)
+            self._spins_m.append(sm); self._spins_s.append(ss)
 
-        # ── Boton Ejecutar Todo ──
-        lbl("EJECUCION RAPIDA", fg=FG_ACC, font=("Segoe UI", 8, "bold")).pack(padx=10, anchor="w", pady=(0,4))
-        lbl("Ejecuta todos los pasos activos en orden", fg=FG_DIM, font=("Segoe UI", 7)).pack(padx=10, anchor="w", pady=(0,4))
+        ttk.Separator(f).pack(fill="x", padx=12, pady=8)
+        L("AUTOMATIZACION", fg=C["acc"], fnt=("Segoe UI", 8, "bold")).pack(padx=12, anchor="w", pady=(0,4))
+        L("Marca Auto cada en los pasos, luego inicia.",
+          fg=C["dim"], fnt=("Segoe UI", 7)).pack(padx=12, anchor="w", pady=(0,6))
 
-        self.btn_all = tk.Button(f, text="EJECUTAR TODO (pasos activos)",
-                                  bg="#89b4fa", fg="#1e1e2e",
-                                  font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", pady=7,
-                                  command=self._run_all)
-        self.btn_all.pack(fill="x", padx=10, pady=(0,4))
+        self._btn_auto = tk.Button(f, text="Iniciar automatizacion",
+                                   bg=C["blue"], fg="#1e1e2e",
+                                   font=("Segoe UI", 9, "bold"),
+                                   relief="flat", cursor="hand2", pady=7,
+                                   command=self._toggle_automatizacion)
+        self._btn_auto.pack(fill="x", padx=12, pady=(0,6))
 
-        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=10, pady=4)
+        self._lbl_status = tk.Label(f, text="Listo", bg=C["panel"],
+                                    fg=C["grn"], font=("Segoe UI", 9, "bold"))
+        self._lbl_status.pack(padx=12, anchor="w", pady=(0,14))
+        _ck("sidebar OK")
 
-        # ── Automatizacion ──
-        lbl("AUTOMATIZACION", fg=FG_ACC, font=("Segoe UI", 8, "bold")).pack(padx=10, anchor="w", pady=(4,4))
-        self.btn_auto = tk.Button(f, text="Iniciar automatizacion", bg="#585b70", fg=FG_MAIN,
-                                   font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", pady=5,
-                                   command=self._toggle_auto)
-        self.btn_auto.pack(fill="x", padx=10, pady=(0,4))
-
-        self.lbl_status = tk.Label(f, text="Listo", bg=BG_LEFT, fg=FG_GRN, font=("Segoe UI", 8, "bold"))
-        self.lbl_status.pack(padx=10, anchor="w", pady=(0,12))
-
-    # ─── PANEL DERECHO ─────────────────────────────────────────────────────
-    def _right_panel(self, p):
-        # Cabecera tabla
-        top = tk.Frame(p, bg=BG_MAIN); top.pack(fill="x", pady=(0,6))
-        tk.Label(top, text="Directorio WhatsApp", bg=BG_MAIN, fg=FG_ACC,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
-        tk.Button(top, text="Actualizar", bg=BG_CELL, fg=FG_MAIN,
+    def _panel_der(self, p):
+        _ck("panel_der")
+        top = tk.Frame(p, bg=C["bg"]); top.pack(fill="x", pady=(0,6))
+        tk.Label(top, text="Directorio de contactos", bg=C["bg"],
+                 fg=C["acc"], font=("Segoe UI", 11, "bold")).pack(side="left")
+        tk.Button(top, text="Actualizar", bg=C["cell"], fg=C["fg"],
                   font=("Segoe UI", 8), relief="flat", cursor="hand2",
-                  command=self._load_table).pack(side="right", padx=4)
-        tk.Button(top, text="Guardar cambios en Azure", bg="#89b4fa", fg="#1e1e2e",
-                  font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
-                  command=self._save_changes).pack(side="right", padx=4)
-        tk.Label(top, text="Doble clic en celda coloreada para editar",
-                 bg=BG_MAIN, fg=FG_DIM, font=("Segoe UI", 8)).pack(side="right", padx=10)
+                  command=self._cargar_tabla).pack(side="right")
+        self._lbl_count = tk.Label(top, text="", bg=C["bg"], fg=C["dim"], font=("Segoe UI", 8))
+        self._lbl_count.pack(side="right", padx=10)
 
-        # Treeview
-        ft = tk.Frame(p, bg=BG_MAIN); ft.pack(fill="both", expand=True)
+        ft = tk.Frame(p, bg=C["bg"]); ft.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(ft, columns=COL_KEYS, show="headings", selectmode="browse")
-        for key, head, width, editable in COLUMNAS:
-            self.tree.heading(key, text=head + (" ✏" if editable else ""),
-                              command=lambda k=key: self._sort(k))
-            self.tree.column(key, width=width, minwidth=50, anchor="w")
-        vsb = ttk.Scrollbar(ft, orient="vertical",   command=self.tree.yview)
-        hsb = ttk.Scrollbar(ft, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side="right",  fill="y")
-        hsb.pack(side="bottom", fill="x")
+        for key, head, width, _ in COLUMNAS:
+            self.tree.heading(key, text=head, command=lambda k=key: self._sort(k))
+            self.tree.column(key, width=width, minwidth=30, anchor="w")
+        vsb2 = ttk.Scrollbar(ft, orient="vertical",   command=self.tree.yview)
+        hsb2 = ttk.Scrollbar(ft, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb2.set, xscrollcommand=hsb2.set)
+        vsb2.pack(side="right", fill="y")
+        hsb2.pack(side="bottom", fill="x")
         self.tree.pack(fill="both", expand=True)
-        self.editor = CellEditor(self.tree, self._on_edit)
-        self.tree.bind("<Double-1>", self.editor.abrir)
 
-        # Consola
-        ttk.Separator(p, orient="horizontal").pack(fill="x", pady=4)
-        tk.Label(p, text="Consola", bg=BG_MAIN, fg=FG_ACC, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        lf = tk.Frame(p, bg=BG_MAIN); lf.pack(fill="x")
-        lsb = ttk.Scrollbar(lf, orient="vertical")
-        self.txt_log = tk.Text(lf, height=8, bg="#11111b", fg=FG_GRN,
-                                font=("Consolas", 8), state="disabled", relief="flat",
-                                yscrollcommand=lsb.set)
-        lsb.configure(command=self.txt_log.yview)
-        lsb.pack(side="right", fill="y"); self.txt_log.pack(side="left", fill="x", expand=True)
+        ttk.Separator(p).pack(fill="x", pady=4)
+        hdr = tk.Frame(p, bg=C["bg"]); hdr.pack(fill="x")
+        tk.Label(hdr, text="Consola", bg=C["bg"], fg=C["acc"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Button(hdr, text="Limpiar", bg=C["cell"], fg=C["dim"],
+                  font=("Segoe UI", 7), relief="flat", cursor="hand2",
+                  command=self._limpiar_log).pack(side="right")
+        lf = tk.Frame(p, bg=C["bg"]); lf.pack(fill="x")
+        lsb2 = ttk.Scrollbar(lf, orient="vertical")
+        self.txt = tk.Text(lf, height=9, bg="#11111b", fg=C["grn"],
+                           font=("Consolas", 8), state="disabled", relief="flat",
+                           yscrollcommand=lsb2.set)
+        lsb2.configure(command=self.txt.yview)
+        lsb2.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="x", expand=True)
+        _ck("panel_der OK")
 
-    # ─── TABLA ─────────────────────────────────────────────────────────────
-    def _load_table(self):
-        self._log("Cargando datos desde Azure...")
+    def _cargar_tabla(self):
+        self._log("Actualizando tabla...")
         def w():
             try:
                 ents = self.az.cargar()
-                self.root.after(0, lambda: self._fill_table(ents))
-            except Exception as e:
-                self._log("Error: {}".format(e))
+                self.root.after(0, lambda: self._poblar(ents))
+            except Exception as exc:
+                self._log("Error Azure: {}".format(exc))
         threading.Thread(target=w, daemon=True).start()
 
-    def _fill_table(self, ents):
-        for i in self.tree.get_children(): self.tree.delete(i)
+    def _poblar(self, ents):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
         self.ents.clear()
+        si = no = 0
         for i, e in enumerate(ents):
-            vals = tuple(e.get(c[0],"") for c in COLUMNAS)
-            tag = "par" if i%2==0 else "impar"
-            iid = self.tree.insert("","end", values=vals, tags=(tag,))
+            vals = tuple(str(e.get(c[0], "") or "") for c in COLUMNAS)
+            rta  = str(e.get("Respuesta_Recibida", "")).upper()
+            if rta == "SI":
+                tag = "si"; si += 1
+            elif rta == "NO":
+                tag = "no"; no += 1
+            else:
+                tag = "par" if i % 2 == 0 else "impar"
+            iid = self.tree.insert("", "end", values=vals, tags=(tag,))
             self.ents[iid] = e
+        self.tree.tag_configure("si",    background="#1a3a22")
+        self.tree.tag_configure("no",    background="#2a2a3e")
         self.tree.tag_configure("par",   background="#2a2a3e")
-        self.tree.tag_configure("impar", background="#313244")
-        self._log("{} contactos cargados.".format(len(ents)))
-
-    def _on_edit(self, iid, col, val):
-        if iid in self.ents: self.ents[iid][col] = val
-
-    def _save_changes(self):
-        def w():
-            ok = 0
-            for e in self.ents.values():
-                try: self.az.guardar(e); ok += 1
-                except Exception as exc: self._log("Error: {}".format(exc))
-            self._log("{} registros guardados.".format(ok))
-        threading.Thread(target=w, daemon=True).start()
+        self.tree.tag_configure("impar", background="#252535")
+        total = len(ents)
+        self._lbl_count.configure(
+            text="{} contactos  SI:{}  NO:{}  Pendientes:{}".format(
+                total, si, no, total - si - no))
+        self._log("Tabla: {} registros".format(total))
 
     def _sort(self, key):
-        items = [(self.tree.set(i, key), i) for i in self.tree.get_children()]
-        items.sort(key=lambda x: x[0].lower())
-        for n,(_, i) in enumerate(items): self.tree.move(i,"",n)
+        rows = [(self.tree.set(i, key), i) for i in self.tree.get_children()]
+        rows.sort(key=lambda x: x[0].lower())
+        for n, (_, i) in enumerate(rows):
+            self.tree.move(i, "", n)
 
-    # ─── WHATSAPP ──────────────────────────────────────────────────────────
-    def _open_wtp(self):
-        if self._wtp:
-            messagebox.showinfo("WhatsApp", "El navegador ya esta abierto."); return
-        self._log("Iniciando WhatsApp Web...")
-        self.btn_wtp.configure(state="disabled", text="Iniciando...")
-        def w():
-            try:
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-                from selenium.webdriver.edge.service import Service
-                from webdriver_manager.microsoft import EdgeChromiumDriverManager
-                from config import PERFIL_WHATSAPP_DIR
-                opts = Options()
-                opts.add_argument("--start-maximized")
-                opts.add_argument("--user-data-dir={}".format(PERFIL_WHATSAPP_DIR))
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                svc = Service(EdgeChromiumDriverManager().install())
-                self.driver = webdriver.Edge(service=svc, options=opts)
-                self.driver.set_page_load_timeout(30)
-                self.driver.get("https://web.whatsapp.com")
-                self._wtp = True
-                self.root.after(0, self._wtp_ready)
-                self._log("WhatsApp Web cargado. Escanea el QR si es necesario.")
-            except Exception as exc:
-                self._log("Error: {}".format(exc))
-                self.root.after(0, lambda: self.btn_wtp.configure(
-                    state="normal", text="Abrir WhatsApp Web"))
-        threading.Thread(target=w, daemon=True).start()
+    def _stdin_para(self, idx):
+        cod  = self.var_pais.get().strip() or "504"
+        cant = self.sp_cantidad.get().strip() or "20"
+        if idx == 1: return "{}\n\n".format(cod)
+        if idx == 2: return "{}\n{}\n".format(cant, cod)
+        if idx == 3: return "\n"
+        if idx == 4: return "{}\n\n".format(cod)
+        return ""
 
-    def _wtp_ready(self):
-        self.btn_wtp.configure(bg=BG_CELL, fg=FG_DIM, text="WhatsApp activo", state="disabled")
-        self.lbl_wtp.configure(text="Estado: sesion activa", fg=FG_GRN)
+    def _lanzar_por_idx(self, idx):
+        label, script, _, _ = PASOS[idx]
+        self._lanzar(script, idx, label)
 
-    # ─── PIPELINE ──────────────────────────────────────────────────────────
-    def _run_paso(self, script, wtp):
+    def _lanzar(self, script, idx=None, label=None):
         if self._busy:
-            self._log("Proceso ocupado, espera..."); return
-        if wtp and not self._wtp:
-            self._log("Requiere WhatsApp activo. Aborta."); return
+            self._log("Proceso en curso."); return
+        ruta = ROOT_DIR / script
+        if not ruta.exists():
+            self._log("No encontrado: {}".format(script)); return
         self._busy = True
-        self._set_status("Ejecutando...", FG_YEL)
-        paso_idx = next((i for i in range(len(PASOS)) if PASOS[i][1]==script), None)
-        sp = ROOT_DIR / script
+        self._set_status("{}".format((label or script)[:30]), C["yel"])
+        for b in self._btns_paso:
+            b.configure(state="disabled")
+        self.root.after(8000, self._auto_refresh)
+        stdin_data = (self._stdin_para(idx) if idx is not None else "").encode()
+
         def w():
             try:
-                self._log("▶ {}".format(script))
-                env = dict(os.environ)
-                env["CANTIDAD_ENVIOS"] = self.spin_cant.get()
-                proc = subprocess.Popen([sys.executable, str(sp)],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, env=env, cwd=str(ROOT_DIR))
-                for line in proc.stdout:
-                    if line.strip(): self._log(line.rstrip())
+                self._log("Iniciando: {}".format(script))
+                if stdin_data:
+                    self._log("stdin: {}".format(repr(stdin_data.decode())))
+                proc = subprocess.Popen(
+                    [sys.executable, str(ruta)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=False,
+                    cwd=str(ROOT_DIR),
+                    env=dict(os.environ))
+                if stdin_data:
+                    proc.stdin.write(stdin_data)
+                proc.stdin.close()
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        self._log(line)
                 proc.wait()
-                self._log("Fin {} (codigo {})".format(script, proc.returncode))
-                if paso_idx is not None: self.sched.mark_done(paso_idx)
+                rc = proc.returncode
+                self._log("Fin {}  {}".format(script, "OK" if rc == 0 else "ERROR({})".format(rc)))
             except Exception as exc:
                 self._log("Error: {}".format(exc))
             finally:
                 self._busy = False
-                self.root.after(0, lambda: self._set_status("Listo", FG_GRN))
-                self.root.after(500, self._load_table)
+                self.root.after(0, lambda: self._set_status("Listo", C["grn"]))
+                self.root.after(0, lambda: [b.configure(state="normal") for b in self._btns_paso])
+                self.root.after(1000, self._cargar_tabla)
+
         threading.Thread(target=w, daemon=True).start()
 
-    def _run_all(self):
-        """Ejecuta en orden todos los pasos con checkbox Auto activo."""
-        activos = [i for i in range(len(PASOS)) if self.chks[i].get()]
-        if not activos:
-            messagebox.showinfo("Ejecutar todo",
-                "Activa el checkbox 'Auto cada' en los pasos que quieras ejecutar."); return
-        def secuencia():
-            for i in activos:
-                label, script, wtp, _ = PASOS[i]
-                self._log("--- Ejecutando paso {}: {}".format(i+1, label))
-                if wtp and not self._wtp:
-                    self._log("Omitido (WhatsApp no activo): {}".format(label)); continue
-                if self._busy:
-                    time.sleep(2)
-                self._run_paso(script, wtp)
-                # Esperar a que termine
-                while self._busy: time.sleep(1)
-                time.sleep(2)
-            self._log("=== Secuencia completada ===")
-        threading.Thread(target=secuencia, daemon=True).start()
+    def _auto_refresh(self):
+        if not self._busy:
+            return
+        self._cargar_tabla()
+        self.root.after(8000, self._auto_refresh)
 
-    def _toggle(self, idx, var):
-        self.sched.states[idx]["active"] = var.get()
-        if var.get(): self.sched.states[idx]["last"] = None
+    def _toggle_auto(self, idx, var):
+        self.sched.estados[idx]["activo"] = var.get()
+        if var.get():
+            self.sched.estados[idx]["ultimo"] = None
 
-    def _upd_interval(self, idx):
+    def _upd_intervalo(self, idx):
         try:
-            sp_d, sp_h, sp_m, sp_s = self.spins[idx]
-            total = (int(sp_d.get()) * 86400 + int(sp_h.get()) * 3600
-                     + int(sp_m.get()) * 60   + int(sp_s.get()))
-            self.sched.states[idx]["interval"] = max(1, total)
-        except (ValueError, TypeError): pass
+            seg = (int(self._spins_d[idx].get()) * 86400
+                 + int(self._spins_h[idx].get()) * 3600
+                 + int(self._spins_m[idx].get()) * 60
+                 + int(self._spins_s[idx].get()))
+            self.sched.estados[idx]["intervalo"] = max(1, seg)
+        except (ValueError, TypeError):
+            pass
 
-    def _toggle_auto(self):
-        if self.sched._run:
-            self.sched.stop()
-            self.btn_auto.configure(text="Iniciar automatizacion", bg="#585b70")
+    def _toggle_automatizacion(self):
+        if self.sched._activo:
+            self.sched.detener()
+            self._btn_auto.configure(text="Iniciar automatizacion", bg=C["blue"])
         else:
-            if not any(s["active"] for s in self.sched.states.values()):
-                messagebox.showinfo("Auto", "Activa 'Auto cada' en al menos un paso."); return
-            self.sched.start()
-            self.btn_auto.configure(text="Detener automatizacion", bg=FG_RED)
+            if not any(e["activo"] for e in self.sched.estados.values()):
+                messagebox.showinfo("Auto", "Marca Auto cada en al menos un paso.")
+                return
+            self.sched.iniciar()
+            self._btn_auto.configure(text="Detener automatizacion", bg=C["red"])
 
     def _poll_sched(self):
-        for i, lbl in enumerate(self.lbls_next):
-            lbl.configure(text="prox: {}".format(self.sched.next_str(i)))
+        for i, lbl in enumerate(self._lbls_prox):
+            lbl.configure(text="prox: {}".format(self.sched.proximo(i)))
         self.root.after(1000, self._poll_sched)
 
-    def _set_status(self, txt, col):
-        self.lbl_status.configure(text=txt, fg=col)
-
-    # ─── LOG ───────────────────────────────────────────────────────────────
     def _log(self, msg):
         self.lq.put("[{}] {}".format(datetime.now().strftime("%H:%M:%S"), msg))
 
-    def _poll_logs(self):
+    def _poll_log(self):
         try:
             while True:
                 msg = self.lq.get_nowait()
-                self.txt_log.configure(state="normal")
-                self.txt_log.insert("end", msg+"\n")
-                self.txt_log.see("end")
-                self.txt_log.configure(state="disabled")
-        except queue.Empty: pass
-        self.root.after(100, self._poll_logs)
+                self.txt.configure(state="normal")
+                self.txt.insert("end", msg + "\n")
+                self.txt.see("end")
+                self.txt.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_log)
 
-    def _attach_log(self):
-        h = QueueLogHandler(self.lq)
-        logging.getLogger().addHandler(h)
+    def _limpiar_log(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
 
-    # ─── CIERRE ────────────────────────────────────────────────────────────
+    def _set_status(self, txt, color):
+        self._lbl_status.configure(text=txt, fg=color)
+
     def _on_close(self):
-        self.sched.stop()
-        if self._wtp and self.driver:
-            try: self.driver.quit()
-            except Exception: pass
+        self.sched.detener()
         self.root.destroy()
 
 
 def main():
-    root = tk.Tk()
-    app  = Dashboard(root)
-    root.protocol("WM_DELETE_WINDOW", app._on_close)
-    root.mainloop()
+    _ck("main()")
+    try:
+        root = tk.Tk()
+        _ck("Tk OK")
+        app = Dashboard(root)
+        _ck("Dashboard OK - mainloop")
+        root.protocol("WM_DELETE_WINDOW", app._on_close)
+        root.mainloop()
+        _ck("mainloop fin")
+    except Exception:
+        msg = traceback.format_exc()
+        _ck("EXCEPCION: " + msg)
+        try:
+            messagebox.showerror("Error dashboard", msg[:800])
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
+    _ck("__main__")
     main()
